@@ -10,5 +10,6 @@ dependencies = [
     "torch>=2.9.0",
     "transformers>=4.57.1",
     "datasets>=3.0.0",
+    "swanlab>=0.3.0",
 ]
 
