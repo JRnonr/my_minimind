@@ -1,6 +1,3 @@
-import math
-from typing import Optional
-
 from transformers import PretrainedConfig
 class MyMindConfig(PretrainedConfig):
     model_type = "mymind"
@@ -73,34 +70,45 @@ class MyMindConfig(PretrainedConfig):
         )
     
 import torch
+import math
 import torch.nn as nn
+from torch.nn import init
+from typing import Optional, Tuple, List, Union
+import torch.nn.functional as F
+from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 # 继承nn.Module类
 class RMSNorm(nn.Module):
-    # __init__初始化
-    def __init__(self, dim:int, eps: float = 1e-5):
+    def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
-        self.dim=dim
-        self.eps=eps
-        self.weight=nn.Parameter(torch.ones(dim))
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
-    # _norm
-    def _norm(self,x):
-        return torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-    # forward
-    def forward(self,x):
-        return self.weight*self._norm(x.float()).type_as(x)*x
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
+    def forward(self, x):
+        return self.weight * self._norm(x.float()).type_as(x)
 
-def precompute_freqs_cis(dim:int,end:int(32*1024),rope_base,rope_scaling:Optional[dict]=None):
+def precompute_freqs_cis(
+    dim:int,
+    end:int(32*1024),
+    rope_base,
+    rope_scaling:Optional[dict]=None):
     #初始化RoPE频率
-    freqs, attn_factor=( 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)),1.0)
+    freqs, attn_factor=(
+        1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)),
+        1.0
+    )
     if rope_scaling is not None:
         orig_max, factor, beta_fast, beta_slow, attn_factor = (
-            rope_scaling["original_max_position_embeddings"],
-            rope_scaling["factor"],
-            rope_scaling["beta_fast"],
-            rope_scaling["beta_slow"]
+            rope_scaling.get("original_max_position_embeddings", 2048),
+            rope_scaling.get("factor", 16),
+            rope_scaling.get("beta_fast", 32.0),
+            rope_scaling.get("beta_slow", 1.0),
+            rope_scaling.get("attention_factor", 1.0),
         )
 
         #推理的长度大于训练长度，使用缩放
@@ -161,3 +169,122 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     )
     return q_embed, k_embed
 
+
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
+        .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+    )
+
+
+class Attention(nn.Module):
+    def __init__(self, args: MyMindConfig):
+        super().__init__()
+
+        self.num_key_value_heads = (
+            args.num_attention_heads
+            if args.num_key_value_heads is None
+            else args.num_key_value_heads
+        )
+
+        assert args.num_attention_heads % self.num_key_value_heads == 0
+
+        self.n_local_heads = args.num_attention_heads
+        self.n_local_kv_heads = self.num_key_value_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.hidden_size // args.num_attention_heads
+
+        self.q_proj = nn.Linear(
+            args.hidden_size, args.num_attention_heads * self.head_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(
+            args.num_attention_heads * self.head_dim, args.hidden_size, bias=False
+        )
+
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+        self.flash = (
+            hasattr(torch.nn.functional, "scaled_dot_product_attention")
+            and args.flash_attention
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache=False,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
+        # 投影，计算q,k,v
+        bsz, seq_len, _ = x.shape
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        # 把输入拆分成多个头，用view
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+
+        #  q和k，使用RoPE
+        cos, sin = position_embeddings
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+
+        # kv_cache实现，把past_key_value拼接到xk和xv中
+        if past_key_value is not None:
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+        past_kv = (xk, xv) if use_cache else None
+
+        # 重复kv，把kv的维度扩展到n_rep倍
+        xq, xk, xv = (
+            xq.transpose(1, 2),
+            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            repeat_kv(xv, self.n_rep).transpose(1, 2),
+        )
+        #进行attention计算，q@k^T/sqrt (d)
+        if (
+            self.flash
+            and (seq_len > 1)
+            and (past_key_value is None)
+            and (attention_mask is None or torch.all(attention_mask == 1))
+        ):
+            output = F.scaled_dot_product_attention(
+                xq,
+                xk,
+                xv,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,
+            )
+        else:
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            scores[:, :, :, -seq_len:] += torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+                diagonal=1,
+            )
+            # 如果有attention_mask，则把attention_mask拼接到scores中
+            if attention_mask is not None:
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                scores = scores + extended_attention_mask
+
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = scores @ xv
+
+        # 把输出拼接到xq中，然后reshape
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        # 输出投影，把维度恢复到hidden_size
+        output = self.resid_dropout(self.o_proj(output))
+        return output, past_kv
