@@ -288,3 +288,33 @@ class Attention(nn.Module):
         # 输出投影，把维度恢复到hidden_size
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
+
+
+class FeedForward(nn.Module):
+    # 初始化
+    # 升维
+    # 降维
+    # 门控
+    # dropout
+    # 激活函数
+    def __init__(self, config: MyMindConfig):
+        super().__init__()
+        if config.intermediate_size is None:
+            intermediate_size = int(config.hidden_size * 8 / 3)
+            config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=False
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.dropout = nn.Dropout(config.dropout)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        return self.dropout(self.down_proj(gated))
