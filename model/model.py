@@ -1,7 +1,7 @@
-from this import d
+import math
+from typing import Optional
+
 from transformers import PretrainedConfig
-
-
 class MyMindConfig(PretrainedConfig):
     model_type = "mymind"
 
@@ -90,3 +90,74 @@ class RMSNorm(nn.Module):
     # forward
     def forward(self,x):
         return self.weight*self._norm(x.float()).type_as(x)*x
+
+
+def precompute_freqs_cis(dim:int,end:int(32*1024),rope_base,rope_scaling:Optional[dict]=None):
+    #初始化RoPE频率
+    freqs, attn_factor=( 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)),1.0)
+    if rope_scaling is not None:
+        orig_max, factor, beta_fast, beta_slow, attn_factor = (
+            rope_scaling["original_max_position_embeddings"],
+            rope_scaling["factor"],
+            rope_scaling["beta_fast"],
+            rope_scaling["beta_slow"]
+        )
+
+        #推理的长度大于训练长度，使用缩放
+        if end>orig_max:
+            # 波长b到i的映射
+            inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (
+                2 * math.log(rope_base)
+            )
+
+            #划分高低维度
+            # low: 不需要缩放的高频部分
+            # high: 需要缩放的低频部分
+            low, high = (
+                max(math.floor(inv_dim(beta_fast)), 0),
+                min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1),
+            )
+
+            # 计算混合因子 γ (Ramp)
+            # 在 low 之前，ramp 为 0；在 high 之后，ramp 为 1；在 low 和 high 之间，线性过渡。
+            # clamp 函数限制了数值只能在 [0, 1] 之间。
+            ramp = torch.clamp(
+                (torch.arange(dim // 2, device=freqs.device).float() - low)
+                / max(high - low, 0.001),
+                0,
+                1,
+            )
+
+            # 频率融合公式：f'(i) = f(i) * ((1-γ) + γ/s)
+            # 当 ramp=0 时（高频）：系数为 1，保持原频率不变。
+            # 当 ramp=1 时（低频）：系数为 1/factor，即对频率进行线性插值缩放。
+            # ramp在0-1之间时：平滑过渡。
+            freqs = freqs * (1 - ramp + ramp / factor)
+    
+        # 根据目标长度 end，生成位置索引向量 t
+        t = torch.arange(end, device=freqs.device)
+
+        # 8. 计算外积：将位置 t 与处理好的频率 freqs 相乘，得到每个位置的旋转角度 θ
+        freqs = torch.outer(t, freqs).float()
+
+        # 9. 计算 Cos 和 Sin，并应用注意力补偿系数 (attn_factor)
+        freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
+        freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+
+        return freqs_cos, freqs_sin
+
+# 编写RoPE
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    def rotate_half(x):
+        return torch.cat(
+            (-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1
+        )
+
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (
+        rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
+    )
+    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (
+        rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
+    )
+    return q_embed, k_embed
+
